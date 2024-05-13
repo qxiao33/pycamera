@@ -3,7 +3,10 @@ import cv2
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D # <--- This is important for 3d plotting 
 import yaml
-
+try:
+    import torch
+except ImportError:
+    Warning("torch not imported")
 
 
 def draw_camera(R, t, color='blue', scale=1, ax=None):
@@ -56,12 +59,38 @@ class CameraParam:
     self.R  - cam_R_world
     self.t  - (world -> t_cam) in camera frame
     '''
-    def __init__(self,K,R,t,distortion=None):
+    def __init__(self,K,R,t,distortion=None, filename=None, backend='numpy',device='cpu'):
         self.K = K 
         self.R = R 
         self.t = t
         self.d = distortion
+        self.filename = filename
+        self.backend = backend
+        self.device = device
 
+    def to_torch(self, device='cpu'):
+        if self.backend == 'torch':
+            return self
+        self.K = torch.tensor(self.K, dtype=torch.float32).to(device)
+        self.R = torch.tensor(self.R, dtype=torch.float32).to(device)
+        self.t = torch.tensor(self.t, dtype=torch.float32).to(device)
+        self.backend = 'torch'
+        self.device = device
+        return self
+
+    def to_numpy(self):
+        if self.backend == 'numpy':
+            return self
+        self.K = self.K.cpu().numpy()
+        self.R = self.R.cpu().numpy()
+        self.t = self.t.cpu().numpy()
+        self.backend = 'numpy'
+        self.device = 'cpu'
+        return self
+
+    def __repr__(self) -> str:
+        return f"CameraParam: \n\tK: {self.K}\n\tR: {self.R}\n\tt: {self.t}\n\tdistortion: {self.d}\n\tfilename: {self.filename}"
+    
     @classmethod
     def from_yaml(cls, yaml_file):
         def read_yaml_file(file_path):
@@ -82,7 +111,7 @@ class CameraParam:
         R =  np.array(camera_param_raw['rotation_matrix']['data']).reshape(3,3)
         t = np.array(camera_param_raw['translation'])
  
-        camera_param = cls(K,R,t)
+        camera_param = cls(K,R,t,distortion=None, filename=yaml_file, backend='numpy')
         return camera_param
 
     def parser(self):
@@ -99,25 +128,12 @@ class CameraParam:
     #     return K1_gtsam, pose1        
     
     def proj2img(self,p,shape=None):
-        '''
-        p - 3 or Nx3
-        uv1 - 3 or Nx3
-
-        uv - N x 2
-        '''
-        K,R,t, d = self.parser()
-        M = self.get_projection_matrix()
-        if len(p.shape) ==1:
-            uv_ =M@np.append(p,1)
-            uv1 = uv_/uv_[2]
-            uv = uv1[:2]
+        if self.backend == 'numpy':
+            return _proj2img_numpy(p, self.K, self.R, self.t)
+        elif self.backend == 'torch':
+            return _proj2img_torch(p, self.K, self.R, self.t, device=self.device)
         else:
-            N = p.shape[0]
-            uv_ = M@np.append(p.T,np.ones((1,N)),axis=0)
-            uv1 = uv_/uv_[2,:]
-            uv = uv1.T[:,:2]
-
-        return uv
+            ValueError("backend in CameraPram not identified")
 
     
     def get_projection_matrix(self):
@@ -133,6 +149,44 @@ class CameraParam:
         return ax
     
 
+def _proj2img_numpy(p, K, R, t):
+    '''
+        p - 3 or Nx3
+        uv1 - 3 or Nx3
+        uv - N x 2
+    '''
+    M = K @ np.block([R,t[:,np.newaxis]])
+    if len(p.shape) ==1:
+        uv_ =M@np.append(p,1)
+        uv1 = uv_/uv_[2]
+        uv = uv1[:2]
+    else:
+        N = p.shape[0]
+        uv_ = M@np.append(p.T,np.ones((1,N)),axis=0)
+        uv1 = uv_/uv_[2,:]
+        uv = uv1.T[:,:2]
+
+    return uv
+
+def _proj2img_torch(p, K, R, t, device='cpu'):
+    '''
+    p - 3 or Nx3
+    uv1 - 3 or Nx3
+    uv - N x 2
+    '''
+
+
+    M = K @ torch.cat((R, t[:, None]), dim=-1)
+    if len(p.shape) == 1:
+        uv_ = M @ torch.cat((p, torch.tensor([1],dtype=torch.float32, device=device)))
+        uv1 = uv_ / uv_[2]
+        uv = uv1[:2]
+    else:
+        N = p.shape[0]
+        uv_ = M @ torch.cat((p.T, torch.ones((1, N),dtype=torch.float32, device=device)), axis=0)
+        uv1 = uv_ / uv_[2, :]
+        uv = uv1.T[:, :2]
+    return uv
 
 def distort_pixel(uv, dist_coeffs, K):
     '''
